@@ -1,0 +1,5 @@
+{
+  "name": "AgriGuard",
+  "description": "Offline plant disease detection and soil health analysis using computer vision and CNN-based feature extraction.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"]
+}

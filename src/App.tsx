@@ -1,0 +1,949 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { 
+  Camera, 
+  Upload, 
+  History, 
+  Leaf, 
+  Droplets, 
+  AlertCircle, 
+  AlertTriangle,
+  CheckCircle2, 
+  ChevronRight, 
+  RefreshCw,
+  MapPin,
+  Info,
+  ArrowLeft,
+  Activity,
+  ShieldCheck,
+  FlaskConical,
+  Award,
+  Search
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import confetti from 'canvas-confetti';
+import { cn } from './lib/utils';
+import { AppState, AnalysisResult } from './types';
+import { preprocessImage, extractSoilFeatures } from './services/imageProcessor';
+import { ModelService } from './services/modelService';
+
+export default function App() {
+  const [state, setState] = useState<AppState>('dashboard');
+  const [leafImage, setLeafImage] = useState<string | null>(null);
+  const [soilImage, setSoilImage] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisStep, setAnalysisStep] = useState(0);
+  const [currentResult, setCurrentResult] = useState<AnalysisResult | null>(null);
+  const [history, setHistory] = useState<AnalysisResult[]>([]);
+  const [language, setLanguage] = useState<'en' | 'ta'>('en');
+  const [isOfflineMode, setIsOfflineMode] = useState(false);
+  const [invalidReason, setInvalidReason] = useState<string | null>(null);
+  const [showEncyclopedia, setShowEncyclopedia] = useState(false);
+  
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Load history from local storage for offline persistence
+  useEffect(() => {
+    const saved = localStorage.getItem('agri_history');
+    if (saved) {
+      try {
+        setHistory(JSON.parse(saved));
+      } catch (e) {
+        console.error("Failed to parse history", e);
+      }
+    }
+  }, []);
+
+  // Sync history to local storage
+  useEffect(() => {
+    localStorage.setItem('agri_history', JSON.stringify(history));
+  }, [history]);
+
+  const saveToHistory = (result: AnalysisResult) => {
+    setHistory(prev => [result, ...prev].slice(0, 20));
+  };
+
+  const clearHistory = () => {
+    if (window.confirm(language === 'en' ? 'Are you sure you want to clear all history?' : 'அனைத்து வரலாற்றையும் அழிக்க வேண்டுமா?')) {
+      setHistory([]);
+    }
+  };
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: 'environment' } 
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+    } catch (err) {
+      console.error("Camera error:", err);
+      alert("Please allow camera access to capture images.");
+    }
+  };
+
+  const stopCamera = () => {
+    if (videoRef.current && videoRef.current.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+    }
+  };
+
+  const captureImage = (type: 'leaf' | 'soil') => {
+    if (videoRef.current && canvasRef.current) {
+      const context = canvasRef.current.getContext('2d');
+      if (context) {
+        canvasRef.current.width = videoRef.current.videoWidth;
+        canvasRef.current.height = videoRef.current.videoHeight;
+        context.drawImage(videoRef.current, 0, 0);
+        const dataUrl = canvasRef.current.toDataURL('image/jpeg');
+        if (type === 'leaf') setLeafImage(dataUrl);
+        else setSoilImage(dataUrl);
+        stopCamera();
+        setState('dashboard');
+      }
+    }
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>, type: 'leaf' | 'soil') => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const dataUrl = event.target?.result as string;
+        if (type === 'leaf') setLeafImage(dataUrl);
+        else setSoilImage(dataUrl);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const exportData = () => {
+    if (!currentResult) return;
+    
+    const report = `
+AGRIGUARD ANALYSIS REPORT
+-------------------------
+ID: ${currentResult.id}
+Date: ${new Date(currentResult.timestamp).toLocaleString()}
+Language: ${currentResult.language === 'ta' ? 'Tamil' : 'English'}
+
+CONDITION DETECTED: ${currentResult.disease}
+Confidence: ${(currentResult.confidence * 100).toFixed(1)}%
+Risk Level: ${currentResult.riskLevel}
+
+SOIL ANALYSIS:
+- Health: ${currentResult.soilHealth}
+- pH Level: ${currentResult.soilDetails?.pH || 'N/A'}
+- Organic Matter: ${currentResult.soilDetails?.organicMatter || 'N/A'}
+- Mineral Content: ${currentResult.soilDetails?.mineralContent || 'N/A'}
+
+RECOMMENDATION:
+${currentResult.recommendation}
+
+PREVENTION:
+${currentResult.prevention.map(p => `- ${p}`).join('\n')}
+
+HOME-MADE SOLUTIONS:
+${currentResult.homeMadeSolutions.map(s => `- ${s}`).join('\n')}
+
+BEST PRACTICES:
+${currentResult.bestPractices.map(b => `- ${b}`).join('\n')}
+
+-------------------------
+Generated by AgriGuard AI
+    `.trim();
+
+    const blob = new Blob([report], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `agri-report-${currentResult.id}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const runAnalysis = async () => {
+    if (!leafImage || !soilImage) return;
+    
+    setState('analyzing');
+    setIsAnalyzing(true);
+    setAnalysisStep(0);
+
+    const model = ModelService.getInstance();
+    await model.init();
+
+    // Step 1: Preprocessing
+    setAnalysisStep(1);
+    await preprocessImage(leafImage);
+    await new Promise(r => setTimeout(r, 800));
+
+    // Step 2: Analysis (Gemini or Local Fallback)
+    setAnalysisStep(2);
+    const [analysis, soilFeatures] = await Promise.all([
+      model.analyzePlantAndSoil(leafImage, soilImage, language, isOfflineMode),
+      extractSoilFeatures(soilImage)
+    ]);
+    setAnalysisStep(3);
+    await new Promise(r => setTimeout(r, 800));
+
+    if (analysis.isPlantRelated === false) {
+      setIsAnalyzing(false);
+      setInvalidReason(analysis.rawReasoning || "The images provided do not appear to be related to plants or soil.");
+      setState('dashboard');
+      return;
+    }
+
+    const result: AnalysisResult = {
+      id: Date.now().toString(),
+      timestamp: Date.now(),
+      leafImage,
+      soilImage,
+      disease: analysis.disease || "Unknown",
+      confidence: analysis.confidence || 0,
+      riskLevel: analysis.riskLevel || "Low",
+      soilHealth: analysis.soilHealth || "Unknown",
+      soilDetails: {
+        organicMatter: soilFeatures.organicMatter,
+        mineralContent: soilFeatures.mineralContent,
+        pH: soilFeatures.pH
+      },
+      recommendation: analysis.recommendation || "No specific recommendation.",
+      prevention: analysis.prevention || [],
+      homeMadeSolutions: analysis.homeMadeSolutions || [],
+      bestPractices: analysis.bestPractices || [],
+      isPlantRelated: true,
+      language
+    };
+
+    setCurrentResult(result);
+    saveToHistory(result);
+    setState('result');
+    setIsAnalyzing(false);
+    confetti({
+      particleCount: 100,
+      spread: 70,
+      origin: { y: 0.6 }
+    });
+  };
+
+  const reset = () => {
+    setLeafImage(null);
+    setSoilImage(null);
+    setCurrentResult(null);
+    setState('dashboard');
+  };
+
+  return (
+    <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans selection:bg-emerald-100">
+      {/* Header */}
+      <header className="sticky top-0 z-50 bg-white/80 backdrop-blur-md border-b border-black/5 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-emerald-200">
+            <Activity size={24} />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold tracking-tight">AgriGuard</h1>
+            <p className="text-[10px] uppercase tracking-widest font-semibold text-emerald-600 opacity-80">Offline AI Diagnostics</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={() => setLanguage(l => l === 'en' ? 'ta' : 'en')}
+            className="px-3 py-1 bg-black text-white text-[10px] font-bold rounded-full uppercase tracking-widest"
+          >
+            {language === 'en' ? 'தமிழ்' : 'English'}
+          </button>
+          <button 
+            onClick={() => setState('history')}
+            className="p-2 hover:bg-black/5 rounded-full transition-colors"
+          >
+            <History size={22} className="text-gray-600" />
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-md mx-auto p-6 pb-24">
+        <AnimatePresence mode="wait">
+          {state === 'dashboard' && (
+            <motion.div 
+              key="dashboard"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="space-y-8"
+            >
+              <section className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-2xl font-bold mb-1">{language === 'en' ? 'New Analysis' : 'புதிய ஆய்வு'}</h2>
+                  <p className="text-gray-500 text-xs">
+                    {language === 'en' 
+                      ? 'Capture leaf and soil images for diagnostics.' 
+                      : 'ஆய்வு செய்ய இலை மற்றும் மண் படங்களை எடுக்கவும்.'}
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setIsOfflineMode(!isOfflineMode)}
+                  className={cn(
+                    "px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all border",
+                    isOfflineMode 
+                      ? "bg-amber-100 border-amber-200 text-amber-700" 
+                      : "bg-emerald-100 border-emerald-200 text-emerald-700"
+                  )}
+                >
+                  {isOfflineMode ? (language === 'en' ? 'Offline' : 'ஆஃப்லைன்') : (language === 'en' ? 'Online' : 'ஆன்லைன்')}
+                </button>
+              </section>
+
+              {invalidReason && (
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="bg-red-50 border border-red-100 p-4 rounded-2xl flex gap-3 items-start"
+                >
+                  <AlertCircle className="text-red-600 flex-shrink-0" size={20} />
+                  <div>
+                    <h4 className="text-sm font-bold text-red-900">{language === 'en' ? 'Invalid Image Detected' : 'தவறான படம் கண்டறியப்பட்டது'}</h4>
+                    <p className="text-xs text-red-700 mt-1">{invalidReason}</p>
+                    <button 
+                      onClick={() => setInvalidReason(null)}
+                      className="text-[10px] font-bold text-red-600 uppercase tracking-widest mt-2"
+                    >
+                      {language === 'en' ? 'Dismiss' : 'நீக்கு'}
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+
+              <div className="grid gap-4">
+                {/* Leaf Capture Card */}
+                <div className={cn(
+                  "relative overflow-hidden rounded-3xl border-2 transition-all duration-300",
+                  leafImage ? "border-emerald-500 bg-emerald-50" : "border-dashed border-gray-200 bg-white"
+                )}>
+                  {leafImage ? (
+                    <div className="relative aspect-video">
+                      <img src={leafImage} className="w-full h-full object-cover" alt="Leaf" />
+                      <button 
+                        onClick={() => setLeafImage(null)}
+                        className="absolute top-2 right-2 p-1.5 bg-black/50 text-white rounded-full backdrop-blur-sm"
+                      >
+                        <RefreshCw size={16} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="p-8 flex flex-col items-center text-center gap-4">
+                      <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center">
+                        <Leaf size={32} />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-lg">Leaf Image</h3>
+                        <p className="text-sm text-gray-500">Capture the affected area</p>
+                      </div>
+                      <div className="flex gap-2 w-full">
+                        <button 
+                          onClick={() => { setState('capture-leaf'); startCamera(); }}
+                          className="flex-1 bg-emerald-600 text-white py-3 rounded-xl font-semibold flex items-center justify-center gap-2 shadow-md"
+                        >
+                          <Camera size={18} /> Camera
+                        </button>
+                        <label className="flex-1 bg-white border border-gray-200 py-3 rounded-xl font-semibold flex items-center justify-center gap-2 cursor-pointer hover:bg-gray-50 transition-colors">
+                          <Upload size={18} /> Upload
+                          <input type="file" accept="image/*" className="hidden" onChange={(e) => handleFileUpload(e, 'leaf')} />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Soil Capture Card */}
+                <div className={cn(
+                  "relative overflow-hidden rounded-3xl border-2 transition-all duration-300",
+                  soilImage ? "border-emerald-500 bg-emerald-50" : "border-dashed border-gray-200 bg-white"
+                )}>
+                  {soilImage ? (
+                    <div className="relative aspect-video">
+                      <img src={soilImage} className="w-full h-full object-cover" alt="Soil" />
+                      <button 
+                        onClick={() => setSoilImage(null)}
+                        className="absolute top-2 right-2 p-1.5 bg-black/50 text-white rounded-full backdrop-blur-sm"
+                      >
+                        <RefreshCw size={16} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="p-8 flex flex-col items-center text-center gap-4">
+                      <div className="w-16 h-16 bg-amber-100 text-amber-700 rounded-2xl flex items-center justify-center">
+                        <Droplets size={32} />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-lg">Soil Image</h3>
+                        <p className="text-sm text-gray-500">Capture soil near the roots</p>
+                      </div>
+                      <div className="flex gap-2 w-full">
+                        <button 
+                          onClick={() => { setState('capture-soil'); startCamera(); }}
+                          className="flex-1 bg-amber-600 text-white py-3 rounded-xl font-semibold flex items-center justify-center gap-2 shadow-md"
+                        >
+                          <Camera size={18} /> Camera
+                        </button>
+                        <label className="flex-1 bg-white border border-gray-200 py-3 rounded-xl font-semibold flex items-center justify-center gap-2 cursor-pointer hover:bg-gray-50 transition-colors">
+                          <Upload size={18} /> Upload
+                          <input type="file" accept="image/*" className="hidden" onChange={(e) => handleFileUpload(e, 'soil')} />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <button 
+                disabled={!leafImage || !soilImage}
+                onClick={runAnalysis}
+                className={cn(
+                  "w-full py-5 rounded-[2rem] flex items-center justify-center gap-3 font-black transition-all duration-300 shadow-xl shadow-black/10",
+                  language === 'ta' ? "text-sm" : "text-base",
+                  leafImage && soilImage 
+                    ? "bg-black text-white hover:scale-[1.02] active:scale-[0.98]" 
+                    : "bg-gray-200 text-gray-400 cursor-not-allowed"
+                )}
+              >
+                <span className="truncate px-4">
+                  {language === 'en' ? 'Analyze Plant Health' : 'தாவர ஆரோக்கியத்தை ஆய்வு செய்'}
+                </span>
+                <ChevronRight size={20} className="flex-shrink-0" />
+              </button>
+
+              {/* Encyclopedia Section */}
+              <section className="pt-4 border-t border-gray-100">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="font-bold text-lg">{language === 'en' ? 'Common Diseases' : 'பொதுவான நோய்கள்'}</h3>
+                  <button 
+                    onClick={() => setShowEncyclopedia(!showEncyclopedia)}
+                    className={cn(
+                      "font-bold text-emerald-600 uppercase tracking-widest transition-all",
+                      language === 'ta' ? "text-xs" : "text-[10px]"
+                    )}
+                  >
+                    {showEncyclopedia ? (language === 'en' ? 'Hide' : 'மறை') : (language === 'en' ? 'View All' : 'அனைத்தையும் பார்')}
+                  </button>
+                </div>
+                
+                <AnimatePresence>
+                  {showEncyclopedia && (
+                    <motion.div 
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      className="grid gap-3 overflow-hidden"
+                    >
+                      {[
+                        { name: 'Early Blight', ta: 'ஆரம்பகால கருகல்', desc: 'Brown spots on leaves, usually starts from bottom.' },
+                        { name: 'Late Blight', ta: 'தாமதமான கருகல்', desc: 'Dark, water-soaked patches on leaves and stems.' },
+                        { name: 'Leaf Mold', ta: 'இலை பூஞ்சை', desc: 'Yellow spots on upper leaf surface, olive-green mold below.' },
+                        { name: 'Spider Mites', ta: 'சிலந்தி பூச்சிகள்', desc: 'Tiny yellow dots and fine webbing on leaves.' }
+                      ].map((disease, i) => (
+                        <div key={i} className="bg-white p-4 rounded-2xl border border-black/5 shadow-sm">
+                          <h4 className="font-bold text-sm">{language === 'en' ? disease.name : disease.ta}</h4>
+                          <p className="text-xs text-gray-500 mt-1">{disease.desc}</p>
+                        </div>
+                      ))}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </section>
+            </motion.div>
+          )}
+
+          {(state === 'capture-leaf' || state === 'capture-soil') && (
+            <motion.div 
+              key="camera"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-[100] bg-black flex flex-col"
+            >
+              <div className="p-6 flex items-center justify-between text-white">
+                <button onClick={() => { stopCamera(); setState('dashboard'); }} className="p-2">
+                  <ArrowLeft size={24} />
+                </button>
+                <span className="font-bold uppercase tracking-widest text-xs">
+                  {state === 'capture-leaf' ? 'Leaf Capture' : 'Soil Capture'}
+                </span>
+                <div className="w-10" />
+              </div>
+              
+              <div className="flex-1 relative overflow-hidden bg-zinc-900 flex items-center justify-center">
+                <video 
+                  ref={videoRef} 
+                  autoPlay 
+                  playsInline 
+                  className="w-full h-full object-cover"
+                />
+                <div className="absolute inset-0 border-[40px] border-black/40 pointer-events-none">
+                  <div className="w-full h-full border-2 border-white/50 rounded-3xl" />
+                </div>
+              </div>
+
+              <div className="p-12 flex items-center justify-center bg-black">
+                <button 
+                  onClick={() => captureImage(state === 'capture-leaf' ? 'leaf' : 'soil')}
+                  className="w-20 h-20 rounded-full border-4 border-white flex items-center justify-center p-1"
+                >
+                  <div className="w-full h-full bg-white rounded-full active:scale-90 transition-transform" />
+                </button>
+              </div>
+              <canvas ref={canvasRef} className="hidden" />
+            </motion.div>
+          )}
+
+          {state === 'analyzing' && (
+            <motion.div 
+              key="analyzing"
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="flex flex-col items-center justify-center min-h-[60vh] text-center space-y-8"
+            >
+              <div className="relative">
+                <div className="w-32 h-32 border-4 border-emerald-100 rounded-full animate-pulse" />
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <RefreshCw className="text-emerald-600 animate-spin" size={48} />
+                </div>
+              </div>
+              
+              <div className="space-y-2">
+                <h2 className="text-2xl font-bold">{language === 'en' ? 'Processing Data' : 'தரவு செயலாக்கப்படுகிறது'}</h2>
+                <p className="text-gray-500">{language === 'en' ? 'Running AI diagnostics...' : 'AI கண்டறிதல் இயங்குகிறது...'}</p>
+              </div>
+
+              <div className="w-full max-w-xs space-y-6">
+                {/* Progress Bar */}
+                <div className="space-y-2">
+                  <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-gray-400">
+                    <span>{language === 'en' ? 'Progress' : 'முன்னேற்றம்'}</span>
+                    <span>{Math.round((analysisStep / 3) * 100)}%</span>
+                  </div>
+                  <div className="h-2 w-full bg-gray-100 rounded-full overflow-hidden">
+                    <motion.div 
+                      className="h-full bg-emerald-500"
+                      initial={{ width: 0 }}
+                      animate={{ width: `${(analysisStep / 3) * 100}%` }}
+                      transition={{ duration: 0.5, ease: "easeOut" }}
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  {[
+                    language === 'en' ? "Preprocessing images..." : "படங்களை முன்கூட்டியே செயலாக்குகிறது...",
+                    language === 'en' ? "Extracting features..." : "அம்சங்களைப் பிரித்தெடுக்கிறது...",
+                    language === 'en' ? "Fusing multimodal data..." : "தரவை இணைக்கிறது..."
+                  ].map((step, i) => (
+                    <div key={i} className="flex items-center gap-3 text-sm">
+                      <div className={cn(
+                        "w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold transition-colors duration-300",
+                        analysisStep > i ? "bg-emerald-500 text-white" : 
+                        analysisStep === i ? "bg-emerald-100 text-emerald-600 animate-pulse" : 
+                        "bg-gray-100 text-gray-400"
+                      )}>
+                        {analysisStep > i ? <CheckCircle2 size={12} /> : i + 1}
+                      </div>
+                      <span className={cn(
+                        "transition-colors duration-300",
+                        analysisStep >= i ? "text-gray-900 font-medium" : "text-gray-400"
+                      )}>{step}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {state === 'result' && currentResult && (
+            <motion.div 
+              key="result"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-6 pb-20"
+            >
+              <div className="bg-white rounded-3xl p-6 shadow-xl shadow-black/5 border border-black/5 space-y-6">
+                <div className="flex items-center justify-between">
+                  <div className={cn(
+                    "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                    currentResult.riskLevel === 'Critical' ? "bg-red-600 text-white" :
+                    currentResult.riskLevel === 'High' ? "bg-orange-500 text-white" :
+                    currentResult.riskLevel === 'Medium' ? "bg-amber-400 text-black" :
+                    "bg-emerald-500 text-white"
+                  )}>
+                    Risk: {currentResult.riskLevel}
+                  </div>
+                  <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                    {new Date(currentResult.timestamp).toLocaleDateString()}
+                  </span>
+                </div>
+
+                <div className="flex gap-4">
+                  <div className="flex-1 aspect-square rounded-2xl overflow-hidden border border-black/5 relative group">
+                    <img src={currentResult.leafImage} className="w-full h-full object-cover" alt="Leaf" />
+                    <div className="absolute inset-x-0 bottom-0 bg-black/60 backdrop-blur-sm text-white text-[8px] py-1 text-center font-black uppercase tracking-widest">LEAF SAMPLE</div>
+                  </div>
+                  <div className="flex-1 aspect-square rounded-2xl overflow-hidden border border-black/5 relative group">
+                    <img src={currentResult.soilImage} className="w-full h-full object-cover" alt="Soil" />
+                    <div className="absolute inset-x-0 bottom-0 bg-black/60 backdrop-blur-sm text-white text-[8px] py-1 text-center font-black uppercase tracking-widest">SOIL SAMPLE</div>
+                  </div>
+                </div>
+
+                <div className="space-y-6 pt-4 border-t border-gray-100">
+                  <div className="flex items-start gap-4">
+                    <div className={cn(
+                      "w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0 shadow-inner",
+                      currentResult.disease === 'Healthy' ? "bg-emerald-100 text-emerald-600" : "bg-red-50 text-red-600"
+                    )}>
+                      {currentResult.disease === 'Healthy' ? <CheckCircle2 size={24} /> : <AlertCircle size={24} />}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[10px] text-gray-400 font-black uppercase tracking-widest mb-1">{language === 'en' ? 'Condition Detected' : 'கண்டறியப்பட்ட நிலை'}</p>
+                      <h3 className="text-2xl font-black tracking-tight leading-tight break-words">{currentResult.disease}</h3>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-6 p-4 bg-gray-50/50 rounded-3xl border border-gray-100">
+                    {/* Radial Confidence Indicator */}
+                    <div className="relative w-20 h-20 flex-shrink-0">
+                      <svg className="w-full h-full transform -rotate-90" viewBox="0 0 64 64">
+                        <circle
+                          cx="32"
+                          cy="32"
+                          r="28"
+                          stroke="currentColor"
+                          strokeWidth="6"
+                          fill="transparent"
+                          className="text-gray-200"
+                        />
+                        <motion.circle
+                          cx="32"
+                          cy="32"
+                          r="28"
+                          stroke="currentColor"
+                          strokeWidth="6"
+                          fill="transparent"
+                          strokeDasharray={175.9}
+                          initial={{ strokeDashoffset: 175.9 }}
+                          animate={{ strokeDashoffset: 175.9 - (175.9 * currentResult.confidence) }}
+                          className="text-emerald-500"
+                          strokeLinecap="round"
+                        />
+                      </svg>
+                      <div className="absolute inset-0 flex flex-col items-center justify-center">
+                        <span className="text-xs font-black leading-none">{(currentResult.confidence * 100).toFixed(0)}%</span>
+                        {currentResult.confidence > 0.8 && <Search size={10} className="text-emerald-600 mt-1" />}
+                      </div>
+                    </div>
+                    
+                    <div>
+                      <p className="text-[10px] font-black text-emerald-600 uppercase tracking-widest mb-1">
+                        {currentResult.confidence > 0.8 
+                          ? (language === 'en' ? 'High Certainty Analysis' : 'உயர் துல்லிய ஆய்வு') 
+                          : (language === 'en' ? 'Preliminary Match' : 'ஆரம்பகட்ட பொருத்தம்')}
+                      </p>
+                      <p className="text-[10px] text-gray-500 leading-tight font-medium">
+                        {language === 'en' 
+                          ? 'AI model analyzed visual patterns with precision.' 
+                          : 'AI மாதிரி காட்சி வடிவங்களை துல்லியமாக ஆய்வு செய்தது.'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+              {/* Soil Analysis Card */}
+              <div className="bg-blue-50/50 p-6 rounded-[2.5rem] border border-blue-100/50 space-y-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse" />
+                    <p className="text-[10px] text-blue-500 font-black uppercase tracking-widest">
+                      {language === 'en' ? 'Soil Analysis' : 'மண் ஆய்வு'}
+                    </p>
+                  </div>
+                  <FlaskConical size={14} className="text-blue-400" />
+                </div>
+                
+                <div className="bg-white/60 p-4 rounded-3xl border border-blue-100/20">
+                  <p className="text-sm font-bold text-blue-900 leading-relaxed">
+                    {currentResult.soilHealth}
+                  </p>
+                </div>
+
+                {currentResult.soilDetails && (
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="bg-white/60 p-3 rounded-2xl border border-blue-100/20 text-center">
+                      <p className="text-[8px] text-blue-400 font-black uppercase mb-1">pH Level</p>
+                      <div className={cn(
+                        "px-2 py-0.5 rounded-full text-[10px] font-black inline-block",
+                        currentResult.soilDetails.pH < 6 ? "bg-orange-100 text-orange-700" :
+                        currentResult.soilDetails.pH > 7.5 ? "bg-blue-100 text-blue-700" :
+                        "bg-emerald-100 text-emerald-700"
+                      )}>
+                        {currentResult.soilDetails.pH}
+                      </div>
+                    </div>
+                    <div className="bg-white/60 p-3 rounded-2xl border border-blue-100/20 text-center">
+                      <p className="text-[8px] text-blue-400 font-black uppercase mb-1">Organic</p>
+                      <p className="text-[10px] font-black text-blue-900">{currentResult.soilDetails.organicMatter}</p>
+                    </div>
+                    <div className="bg-white/60 p-3 rounded-2xl border border-blue-100/20 text-center">
+                      <p className="text-[8px] text-blue-400 font-black uppercase mb-1">Minerals</p>
+                      <p className="text-[10px] font-black text-blue-900 truncate">{currentResult.soilDetails.mineralContent}</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+                    <div className={cn(
+                      "p-5 rounded-3xl border flex items-center justify-between",
+                      currentResult.riskLevel === 'Critical' ? "bg-red-50 border-red-100" :
+                      currentResult.riskLevel === 'High' ? "bg-orange-50 border-orange-100" :
+                      currentResult.riskLevel === 'Medium' ? "bg-amber-50 border-amber-100" :
+                      "bg-emerald-50 border-emerald-100"
+                    )}>
+                      <div>
+                        <p className={cn(
+                          "text-[10px] font-black uppercase tracking-widest mb-1",
+                          currentResult.riskLevel === 'Critical' ? "text-red-400" :
+                          currentResult.riskLevel === 'High' ? "text-orange-400" :
+                          currentResult.riskLevel === 'Medium' ? "text-amber-500" :
+                          "text-emerald-500"
+                        )}>Risk Assessment</p>
+                        <p className={cn(
+                          "text-xl font-black tracking-tight",
+                          currentResult.riskLevel === 'Critical' ? "text-red-900" :
+                          currentResult.riskLevel === 'High' ? "text-orange-900" :
+                          currentResult.riskLevel === 'Medium' ? "text-amber-900" :
+                          "text-emerald-900"
+                        )}>{currentResult.riskLevel}</p>
+                      </div>
+                      <div className={cn(
+                        "w-12 h-12 rounded-2xl flex items-center justify-center",
+                        currentResult.riskLevel === 'Critical' ? "bg-red-100 text-red-600" :
+                        currentResult.riskLevel === 'High' ? "bg-orange-100 text-orange-600" :
+                        currentResult.riskLevel === 'Medium' ? "bg-amber-100 text-amber-600" :
+                        "bg-emerald-100 text-emerald-600"
+                      )}>
+                        <AlertTriangle size={24} />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="bg-emerald-600 p-5 rounded-3xl text-white shadow-lg shadow-emerald-200">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Info size={18} />
+                        <span className="text-[10px] font-black uppercase tracking-widest">Primary Action</span>
+                      </div>
+                      <p className="text-sm font-medium leading-relaxed">
+                        {currentResult.recommendation}
+                      </p>
+                    </div>
+
+                    {/* Prevention Section */}
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-2 px-1">
+                        <div className="w-6 h-6 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center">
+                          <ShieldCheck size={14} />
+                        </div>
+                        <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400">
+                          {language === 'en' ? 'How to Prevent' : 'தடுக்கும் முறைகள்'}
+                        </h4>
+                      </div>
+                      <div className="grid gap-2.5">
+                        {currentResult.prevention.map((item, i) => (
+                          <motion.div 
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ delay: i * 0.1 }}
+                            key={i} 
+                            className="group bg-white p-4 rounded-2xl border border-black/5 shadow-sm hover:border-emerald-200 transition-colors"
+                          >
+                            <div className="flex items-start gap-3">
+                              <div className="mt-1 w-1.5 h-1.5 bg-emerald-500 rounded-full group-hover:scale-125 transition-transform" />
+                              <span className="text-xs font-bold text-gray-700 leading-relaxed">{item}</span>
+                            </div>
+                          </motion.div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Home-made Solutions */}
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-2 px-1">
+                        <div className="w-6 h-6 rounded-lg bg-amber-100 text-amber-600 flex items-center justify-center">
+                          <FlaskConical size={14} />
+                        </div>
+                        <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400">
+                          {language === 'en' ? 'Home-made Solutions' : 'வீட்டு வைத்தியம்'}
+                        </h4>
+                      </div>
+                      <div className="grid gap-2.5">
+                        {currentResult.homeMadeSolutions.map((item, i) => (
+                          <motion.div 
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ delay: (i + 2) * 0.1 }}
+                            key={i} 
+                            className="bg-amber-50/50 p-4 rounded-2xl border border-amber-100/50 hover:bg-amber-50 transition-colors"
+                          >
+                            <div className="flex items-start gap-3">
+                              <div className="mt-0.5 px-1.5 py-0.5 bg-amber-200 text-amber-700 rounded text-[8px] font-black uppercase tracking-tighter">DIY</div>
+                              <span className="text-xs font-bold text-amber-900 leading-relaxed">{item}</span>
+                            </div>
+                          </motion.div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Best Practices */}
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-2 px-1">
+                        <div className="w-6 h-6 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center">
+                          <Award size={14} />
+                        </div>
+                        <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400">
+                          {language === 'en' ? 'Best Practices' : 'சிறந்த நடைமுறைகள்'}
+                        </h4>
+                      </div>
+                      <div className="grid gap-2.5">
+                        {currentResult.bestPractices.map((item, i) => (
+                          <motion.div 
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ delay: (i + 4) * 0.1 }}
+                            key={i} 
+                            className="bg-zinc-50 p-4 rounded-2xl border border-zinc-200/50 hover:border-blue-200 transition-colors"
+                          >
+                            <div className="flex items-start gap-3">
+                              <CheckCircle2 size={14} className="text-blue-500 mt-0.5 flex-shrink-0" />
+                              <span className="text-xs font-bold text-gray-600 leading-relaxed">{item}</span>
+                            </div>
+                          </motion.div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+              <div className="flex gap-3">
+                <button 
+                  onClick={reset}
+                  className="flex-1 py-4 bg-black text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-zinc-800 transition-all active:scale-95"
+                >
+                  New Scan
+                </button>
+                <button 
+                  onClick={exportData}
+                  className="px-6 py-4 bg-white border border-gray-200 text-gray-600 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-gray-50 transition-all active:scale-95"
+                >
+                  Export
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {state === 'history' && (
+            <motion.div 
+              key="history"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="space-y-6 pb-20"
+            >
+              <div className="flex items-center justify-between mb-8">
+                <div className="flex items-center gap-4">
+                  <button onClick={() => setState('dashboard')} className="p-2 hover:bg-black/5 rounded-full">
+                    <ArrowLeft size={24} />
+                  </button>
+                  <h2 className="text-2xl font-bold">{language === 'en' ? 'History' : 'வரலாறு'}</h2>
+                </div>
+                {history.length > 0 && (
+                  <button 
+                    onClick={clearHistory}
+                    className={cn(
+                      "font-bold text-red-600 uppercase tracking-widest bg-red-50 px-4 py-2 rounded-xl border border-red-100 transition-all active:scale-95",
+                      language === 'ta' ? "text-xs" : "text-[10px]"
+                    )}
+                  >
+                    {language === 'en' ? 'Clear All' : 'அனைத்தையும் அழி'}
+                  </button>
+                )}
+              </div>
+
+              {history.length === 0 ? (
+                <div className="text-center py-20 text-gray-400">
+                  <History size={48} className="mx-auto mb-4 opacity-20" />
+                  <p>No previous analyses found.</p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {history.map((item) => (
+                    <div 
+                      key={item.id}
+                      onClick={() => { setCurrentResult(item); setState('result'); }}
+                      className="bg-white p-4 rounded-3xl border border-black/5 flex items-center gap-4 cursor-pointer hover:border-emerald-200 transition-all"
+                    >
+                      <div className="w-16 h-16 rounded-2xl overflow-hidden flex-shrink-0 border border-black/5">
+                        <img src={item.leafImage} className="w-full h-full object-cover" alt="Leaf" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <h4 className="font-bold truncate">{item.disease}</h4>
+                        <p className="text-xs text-gray-500">{new Date(item.timestamp).toLocaleDateString()}</p>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-xs font-bold text-emerald-600">{(item.confidence * 100).toFixed(0)}%</div>
+                        <ChevronRight size={16} className="text-gray-300 ml-auto" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Bottom Navigation (Mobile Style) */}
+      {state !== 'capture-leaf' && state !== 'capture-soil' && (
+        <nav className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-md border-t border-black/5 px-8 py-4 flex justify-around items-center z-40">
+          <button 
+            onClick={() => setState('dashboard')}
+            className={cn(
+              "flex flex-col items-center gap-1 transition-colors",
+              state === 'dashboard' ? "text-emerald-600" : "text-gray-400"
+            )}
+          >
+            <Activity size={24} />
+            <span className="text-[10px] font-bold uppercase tracking-tighter">
+              {language === 'en' ? 'Analyze' : 'ஆய்வு'}
+            </span>
+          </button>
+          <button 
+            onClick={() => setState('history')}
+            className={cn(
+              "flex flex-col items-center gap-1 transition-colors",
+              state === 'history' ? "text-emerald-600" : "text-gray-400"
+            )}
+          >
+            <History size={24} />
+            <span className="text-[10px] font-bold uppercase tracking-tighter">
+              {language === 'en' ? 'History' : 'வரலாறு'}
+            </span>
+          </button>
+          <div className="flex flex-col items-center gap-1 text-gray-400">
+            <MapPin size={24} />
+            <span className="text-[10px] font-bold uppercase tracking-tighter">
+              {language === 'en' ? 'Map' : 'வரைபடம்'}
+            </span>
+          </div>
+        </nav>
+      )}
+    </div>
+  );
+}
